@@ -11,17 +11,17 @@
 
 declare(strict_types=1);
 
-namespace ApiPlatform\HttpCache\EventListener;
+namespace ApiPlatform\HttpCache\State;
 
 use ApiPlatform\HttpCache\PurgerInterface;
 use ApiPlatform\Metadata\CollectionOperationInterface;
+use ApiPlatform\Metadata\HttpOperation;
 use ApiPlatform\Metadata\IriConverterInterface;
-use ApiPlatform\Metadata\Resource\Factory\ResourceMetadataCollectionFactoryInterface;
+use ApiPlatform\Metadata\Operation;
 use ApiPlatform\Metadata\UrlGeneratorInterface;
+use ApiPlatform\State\ProcessorInterface;
 use ApiPlatform\State\UriVariablesResolverTrait;
-use ApiPlatform\Util\OperationRequestInitiatorTrait;
-use ApiPlatform\Util\RequestAttributesExtractor;
-use Symfony\Component\HttpKernel\Event\ResponseEvent;
+use Symfony\Component\HttpFoundation\Response;
 
 /**
  * Sets the list of resources' IRIs included in this response in the configured cache tag HTTP header and/or "xkey" HTTP headers.
@@ -34,56 +34,49 @@ use Symfony\Component\HttpKernel\Event\ResponseEvent;
  * @see https://docs.varnish-software.com/varnish-cache-plus/vmods/ykey/
  *
  * @author Kévin Dunglas <dunglas@gmail.com>
- *
- *  @deprecated use \Symfony\EventListener\AddTagsListener.php instead
  */
-final class AddTagsListener
+final class AddTagsProcessor implements ProcessorInterface
 {
-    use OperationRequestInitiatorTrait;
     use UriVariablesResolverTrait;
 
-    public function __construct(private readonly IriConverterInterface $iriConverter, ResourceMetadataCollectionFactoryInterface $resourceMetadataCollectionFactory = null, private readonly ?PurgerInterface $purger = null)
+    public function __construct(private readonly ProcessorInterface $decorated, private readonly IriConverterInterface $iriConverter, private readonly ?PurgerInterface $purger = null)
     {
-        $this->resourceMetadataCollectionFactory = $resourceMetadataCollectionFactory;
     }
 
     /**
      * Adds the configured HTTP cache tag and "xkey" headers.
      */
-    public function onKernelResponse(ResponseEvent $event): void
+    public function process(mixed $data, Operation $operation, array $uriVariables = [], array $context = []): mixed
     {
-        $request = $event->getRequest();
-        $operation = $this->initializeOperation($request);
-        if ('api_platform.symfony.main_controller' === $operation?->getController()) {
-            return;
-        }
-        $response = $event->getResponse();
+        $response = $this->decorated->process($data, $operation, $uriVariables, $context);
 
         if (
-            !$request->isMethodCacheable()
+            !($request = $context['request'] ?? null)
+            || !$request->isMethodCacheable()
+            || !$response instanceof Response
+            || !$operation instanceof HttpOperation
             || !$response->isCacheable()
-            || (!$attributes = RequestAttributesExtractor::extractAttributes($request))
         ) {
-            return;
+            return $response;
         }
 
-        $resources = $request->attributes->get('_resources');
+        $resources = $request->attributes->get('_resources', []);
         if ($operation instanceof CollectionOperationInterface) {
             // Allows to purge collections
-            $uriVariables = $this->getOperationUriVariables($operation, $request->attributes->all(), $attributes['resource_class']);
-            $iri = $this->iriConverter->getIriFromResource($attributes['resource_class'], UrlGeneratorInterface::ABS_PATH, $operation, ['uri_variables' => $uriVariables]);
+            $uriVariables = $this->getOperationUriVariables($operation, $request->attributes->all(), $operation->getClass());
+            $iri = $this->iriConverter->getIriFromResource($operation->getClass(), UrlGeneratorInterface::ABS_PATH, $operation, ['uri_variables' => $uriVariables]);
 
             $resources[$iri] = $iri;
         }
 
         if (!$resources) {
-            return;
+            return $response;
         }
 
         if (!$this->purger) {
             $response->headers->set('Cache-Tags', implode(',', $resources));
 
-            return;
+            return $response;
         }
 
         $headers = $this->purger->getResponseHeaders($resources);
@@ -91,5 +84,7 @@ final class AddTagsListener
         foreach ($headers as $key => $value) {
             $response->headers->set($key, $value);
         }
+
+        return $response;
     }
 }

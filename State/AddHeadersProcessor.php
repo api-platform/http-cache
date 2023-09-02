@@ -11,55 +11,43 @@
 
 declare(strict_types=1);
 
-namespace ApiPlatform\HttpCache\EventListener;
+namespace ApiPlatform\HttpCache\State;
 
-use ApiPlatform\Metadata\Resource\Factory\ResourceMetadataCollectionFactoryInterface;
-use ApiPlatform\Util\OperationRequestInitiatorTrait;
-use ApiPlatform\Util\RequestAttributesExtractor;
-use Symfony\Component\HttpKernel\Event\ResponseEvent;
+use ApiPlatform\Metadata\HttpOperation;
+use ApiPlatform\Metadata\Operation;
+use ApiPlatform\State\ProcessorInterface;
+use Symfony\Component\HttpFoundation\Response;
 
-/**
- * Configures cache HTTP headers for the current response.
- *
- * @author Kévin Dunglas <dunglas@gmail.com>
- *
- * @deprecated use \Symfony\EventListener\AddHeadersListener.php instead
- */
-final class AddHeadersListener
+final class AddHeadersProcessor implements ProcessorInterface
 {
-    use OperationRequestInitiatorTrait;
-
-    public function __construct(private readonly bool $etag = false, private readonly ?int $maxAge = null, private readonly ?int $sharedMaxAge = null, private readonly ?array $vary = null, private readonly ?bool $public = null, ResourceMetadataCollectionFactoryInterface $resourceMetadataCollectionFactory = null, private readonly ?int $staleWhileRevalidate = null, private readonly ?int $staleIfError = null)
+    /**
+     * @param ProcessorInterface<Response>|ProcessorInterface<mixed> $decorated
+     */
+    public function __construct(private readonly ProcessorInterface $decorated, private readonly bool $etag = false, private readonly ?int $maxAge = null, private readonly ?int $sharedMaxAge = null, private readonly ?array $vary = null, private readonly ?bool $public = null, private readonly ?int $staleWhileRevalidate = null, private readonly ?int $staleIfError = null)
     {
-        $this->resourceMetadataCollectionFactory = $resourceMetadataCollectionFactory;
     }
 
-    public function onKernelResponse(ResponseEvent $event): void
+    public function process(mixed $data, Operation $operation, array $uriVariables = [], array $context = []): mixed
     {
-        $request = $event->getRequest();
-        if (!$request->isMethodCacheable()) {
-            return;
+        $response = $this->decorated->process($data, $operation, $uriVariables, $context);
+
+        if (
+            !($request = $context['request'] ?? null)
+            || !$request->isMethodCacheable()
+            || !$response instanceof Response
+            || !$operation instanceof HttpOperation
+        ) {
+            return $response;
         }
 
-        $attributes = RequestAttributesExtractor::extractAttributes($request);
-        if (\count($attributes) < 1) {
-            return;
+        if (!($content = $response->getContent()) || !$response->isSuccessful()) {
+            return $response;
         }
 
-        $response = $event->getResponse();
-
-        if (!$response->getContent() || !$response->isSuccessful()) {
-            return;
-        }
-
-        $operation = $this->initializeOperation($request);
-        if ('api_platform.symfony.main_controller' === $operation?->getController()) {
-            return;
-        }
-        $resourceCacheHeaders = $attributes['cache_headers'] ?? $operation?->getCacheHeaders() ?? [];
+        $resourceCacheHeaders = $operation->getCacheHeaders() ?? [];
 
         if ($this->etag && !$response->getEtag()) {
-            $response->setEtag(md5((string) $response->getContent()));
+            $response->setEtag(md5((string) $content));
         }
 
         if (null !== ($maxAge = $resourceCacheHeaders['max_age'] ?? $this->maxAge) && !$response->headers->hasCacheControlDirective('max-age')) {
@@ -89,5 +77,7 @@ final class AddHeadersListener
         if (null !== ($staleIfError = $resourceCacheHeaders['stale_if_error'] ?? $this->staleIfError) && !$response->headers->hasCacheControlDirective('stale-if-error')) {
             $response->headers->addCacheControlDirective('stale-if-error', (string) $staleIfError);
         }
+
+        return $response;
     }
 }
